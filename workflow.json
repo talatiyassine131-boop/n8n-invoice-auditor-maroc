@@ -1,0 +1,407 @@
+{
+  "name": "Contrôle Automatique des Factures - Gemini + Validation Fiscale",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 📋 Instructions de configuration\n\n1. **Google Drive Trigger** : choisir le dossier surveillé (ex: `Factures_A_Traiter`)\n2. **Credentials Google Drive** : à connecter sur les 4 nœuds Google Drive\n3. **Credentials Gemini** : créer une credential \"Header Auth\" avec le header `x-goog-api-key` = votre clé API Gemini, à connecter sur les 2 nœuds HTTP Request Gemini\n4. **Google Sheets** : remplacer `VOTRE_ID_GOOGLE_SHEET` par l'ID réel du classeur (3 endroits), et créer les onglets: `Historique`, `Factures_Validées`, `Anomalies`\n5. **Slack** : connecter votre credential Slack et adapter le nom du channel\n6. **IDs de dossiers Drive** : remplacer `ID_DOSSIER_VALIDEES` et `ID_DOSSIER_A_VERIFIER`\n\n💡 Pour WhatsApp au lieu de/en plus de Slack : ajouter un nœud HTTP Request vers l'API Twilio WhatsApp ou Meta WhatsApp Business, branché en parallèle du nœud Slack.",
+        "height": 460,
+        "width": 380
+      },
+      "id": "sticky1",
+      "name": "📋 Instructions de Configuration",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-260, -60]
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            { "mode": "everyMinute" }
+          ]
+        },
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "event": "fileCreated"
+      },
+      "id": "node1",
+      "name": "Déclencheur Google Drive",
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.id }}"
+        },
+        "options": {}
+      },
+      "id": "node2",
+      "name": "Télécharger le Fichier",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [260, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nreturn items.map(item => {\n  const binaryData = item.binary.data;\n  return {\n    json: {\n      fileId: item.json.id,\n      fileName: binaryData.fileName || item.json.name,\n      mimeType: binaryData.mimeType,\n      base64: binaryData.data,\n      webViewLink: item.json.webViewLink\n    }\n  };\n});"
+      },
+      "id": "node3",
+      "name": "Préparer Base64 & Métadonnées",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [520, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"contents\": [ { \"parts\": [ { \"text\": \"Tu es un expert-comptable au Maroc. Analyse cette facture ou ce recu et extrais les informations suivantes avec precision. Reponds UNIQUEMENT avec un objet JSON valide, sans texte avant ni apres, sans balises markdown, contenant exactement ces champs : fournisseur (chaine), ice (chaine de 15 chiffres si visible sinon null), date_facture (format AAAA-MM-JJ), numero_facture (chaine), montant_ht (nombre), taux_tva (nombre, ex 20 pour 20 pourcent), montant_tva (nombre), montant_ttc (nombre), nature_operation (chaine courte decrivant la nature: achat de marchandises, frais de transport, frais de restauration, prestation de services, etc), devise (chaine, ex MAD). Si un champ est illisible ou absent, mets la valeur null. Ne jamais inventer de chiffres.\" }, { \"inline_data\": { \"mime_type\": $json.mimeType, \"data\": $json.base64 } } ] } ], \"generationConfig\": { \"response_mime_type\": \"application/json\", \"temperature\": 0.1 } } }}",
+        "options": {}
+      },
+      "id": "node4",
+      "name": "Gemini - Extraction Facture",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [780, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst meta = $node[\"Préparer Base64 & Métadonnées\"].json;\n\nlet text = '';\ntry {\n  text = response.candidates[0].content.parts[0].text;\n} catch (e) {\n  text = '{}';\n}\ntext = text.trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();\n\nlet facture;\ntry {\n  facture = JSON.parse(text);\n} catch (e) {\n  facture = { erreur_parsing: true, texte_brut: text };\n}\n\nreturn [{\n  json: {\n    ...facture,\n    fileId: meta.fileId,\n    fileName: meta.fileName,\n    webViewLink: meta.webViewLink\n  }\n}];"
+      },
+      "id": "node5",
+      "name": "Parser Extraction Gemini",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const facture = $input.first().json;\nconst erreurs = [];\nconst avertissements = [];\n\nconst ht = parseFloat(facture.montant_ht);\nconst tva = parseFloat(facture.montant_tva);\nconst ttc = parseFloat(facture.montant_ttc);\nconst taux = parseFloat(facture.taux_tva);\nconst ice = (facture.ice || '').toString().replace(/\\s/g, '');\nconst nature = (facture.nature_operation || '').toLowerCase();\n\n// 1. Controle mathematique HT + TVA = TTC\nif (!isNaN(ht) && !isNaN(tva) && !isNaN(ttc)) {\n  const ecart = Math.abs((ht + tva) - ttc);\n  if (ecart > 0.5) {\n    erreurs.push('Erreur de calcul : HT (' + ht + ') + TVA (' + tva + ') = ' + (ht + tva).toFixed(2) + ' ne correspond pas au TTC declare (' + ttc + ')');\n  }\n} else {\n  erreurs.push('Montants HT, TVA ou TTC illisibles ou manquants');\n}\n\n// 2. Controle coherence taux vs montant TVA\nif (!isNaN(ht) && !isNaN(taux) && !isNaN(tva)) {\n  const tvaTheorique = ht * taux / 100;\n  if (Math.abs(tvaTheorique - tva) > 0.5) {\n    erreurs.push('Le montant de TVA (' + tva + ') ne correspond pas au taux applique (' + taux + '%) sur le HT (' + ht + '). TVA attendue : ' + tvaTheorique.toFixed(2));\n  }\n}\n\n// 3. Controle ICE (15 chiffres)\nif (!/^\\d{15}$/.test(ice)) {\n  erreurs.push('ICE invalide : ' + (ice || 'absent') + ' (doit contenir exactement 15 chiffres)');\n}\n\n// 4. Controle coherence taux TVA / nature operation (regles Maroc, indicatif)\nconst tauxAttendus = {\n  transport: 14, energie: 14, petrole: 14, carburant: 14,\n  restauration: 10, hebergement: 10, hotellerie: 10, banque: 10, credit: 10,\n  eau: 7, electricite: 7,\n  export: 0, exonere: 0\n};\nfor (const cle in tauxAttendus) {\n  if (nature.includes(cle)) {\n    if (!isNaN(taux) && taux !== tauxAttendus[cle]) {\n      avertissements.push('Taux de TVA (' + taux + '%) inhabituel pour une operation de type \\'' + cle + '\\' (taux courant attendu : ' + tauxAttendus[cle] + '%). A verifier.');\n    }\n  }\n}\nconst tauxValides = [0, 7, 10, 14, 20];\nif (!isNaN(taux) && !tauxValides.includes(taux)) {\n  erreurs.push('Taux de TVA non standard au Maroc : ' + taux + '%');\n}\n\nreturn [{\n  json: {\n    ...facture,\n    validation: {\n      erreurs,\n      avertissements,\n      controle_mathematique_ok: erreurs.length === 0\n    }\n  }\n}];"
+      },
+      "id": "node6",
+      "name": "Contrôle Fiscal & Mathématique",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 300]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "VOTRE_ID_GOOGLE_SHEET"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Historique"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "Fournisseur",
+              "lookupValue": "={{ $json.fournisseur }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node7",
+      "name": "Google Sheets - Historique Fournisseur",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1560, 300],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const facture = $node[\"Contrôle Fiscal & Mathématique\"].json;\nconst historique = $input.all().map(i => i.json).filter(r => r && Object.keys(r).length > 0);\n\nreturn [{\n  json: {\n    facture,\n    historique\n  }\n}];"
+      },
+      "id": "node8",
+      "name": "Agréger Historique",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1820, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"contents\": [ { \"parts\": [ { \"text\": \"Tu es un expert-comptable qui detecte les anomalies dans les factures fournisseurs. Analyse la facture actuelle par rapport a l historique des factures du meme fournisseur. Verifie notamment: presence de factures en double (meme numero, ou meme montant et meme date), montant anormalement eleve par rapport a la moyenne habituelle de ce fournisseur, rupture suspecte dans la numerotation, ou toute autre incoherence. Reponds UNIQUEMENT avec un objet JSON valide, sans texte avant ni apres, sans balises markdown, contenant exactement ces champs: anomalie_detectee (booleen), type_anomalie (chaine ou null), niveau_risque (une valeur parmi: faible, moyen, eleve), explication (courte phrase en francais expliquant le raisonnement). Historique du fournisseur (JSON): \" + JSON.stringify($json.historique) + \" Facture a analyser (JSON): \" + JSON.stringify($json.facture) } ] } ], \"generationConfig\": { \"response_mime_type\": \"application/json\", \"temperature\": 0.1 } } }}",
+        "options": {}
+      },
+      "id": "node9",
+      "name": "Gemini - Détection Anomalies",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2080, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst facture = $node[\"Agréger Historique\"].json.facture;\n\nlet text = '';\ntry {\n  text = response.candidates[0].content.parts[0].text;\n} catch (e) {\n  text = '{}';\n}\ntext = text.trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();\n\nlet anomalie;\ntry {\n  anomalie = JSON.parse(text);\n} catch (e) {\n  anomalie = { anomalie_detectee: false, type_anomalie: null, niveau_risque: 'faible', explication: 'Analyse IA indisponible' };\n}\n\nreturn [{\n  json: {\n    ...anomalie,\n    facture\n  }\n}];"
+      },
+      "id": "node10",
+      "name": "Parser Anomalie Gemini",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2340, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const anomalie = $input.first().json;\nconst facture = anomalie.facture;\nconst validation = facture.validation || { erreurs: [], avertissements: [] };\n\nconst erreursFinales = [...validation.erreurs];\nif (anomalie.anomalie_detectee && anomalie.niveau_risque !== 'faible') {\n  erreursFinales.push('Anomalie IA detectee (risque ' + anomalie.niveau_risque + ') : ' + anomalie.explication);\n}\n\nconst statut = erreursFinales.length === 0 ? 'VALIDE' : 'ANOMALIE';\n\nreturn [{\n  json: {\n    ...facture,\n    anomalie_ia: {\n      anomalie_detectee: anomalie.anomalie_detectee,\n      type_anomalie: anomalie.type_anomalie,\n      niveau_risque: anomalie.niveau_risque,\n      explication: anomalie.explication\n    },\n    statut,\n    erreurs_finales: erreursFinales,\n    avertissements: validation.avertissements\n  }\n}];"
+      },
+      "id": "node11",
+      "name": "Décision Finale",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2600, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond1",
+              "leftValue": "={{ $json.statut }}",
+              "rightValue": "VALIDE",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node12",
+      "name": "IF - Facture Valide ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2860, 300]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "VOTRE_ID_GOOGLE_SHEET"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Factures_Validées"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Fournisseur": "={{ $json.fournisseur }}",
+            "ICE": "={{ $json.ice }}",
+            "Date": "={{ $json.date_facture }}",
+            "Numero": "={{ $json.numero_facture }}",
+            "Montant_HT": "={{ $json.montant_ht }}",
+            "Taux_TVA": "={{ $json.taux_tva }}",
+            "Montant_TVA": "={{ $json.montant_tva }}",
+            "Montant_TTC": "={{ $json.montant_ttc }}",
+            "Nature": "={{ $json.nature_operation }}",
+            "Statut": "={{ $json.statut }}",
+            "Lien_Fichier": "={{ $json.webViewLink }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "node13",
+      "name": "Google Sheets - Ajouter Facture Validée",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [3120, 180]
+    },
+    {
+      "parameters": {
+        "operation": "move",
+        "fileId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.fileId }}"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "ID_DOSSIER_VALIDEES"
+        },
+        "options": {}
+      },
+      "id": "node14",
+      "name": "Google Drive - Déplacer vers Validées",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [3380, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "const f = $input.first().json;\nconst erreurs = (f.erreurs_finales || []).map(e => '• ' + e).join('\\n');\nconst message = ':rotating_light: *Anomalie facture détectée*\\n\\n' +\n  '*Fournisseur* : ' + (f.fournisseur || 'Inconnu') + '\\n' +\n  '*N° facture* : ' + (f.numero_facture || 'N/A') + '\\n' +\n  '*Montant TTC* : ' + (f.montant_ttc || 'N/A') + ' ' + (f.devise || 'MAD') + '\\n\\n' +\n  '*Erreurs détectées :*\\n' + erreurs + '\\n\\n' +\n  '*Lien du fichier* : ' + f.webViewLink;\n\nreturn [{ json: { ...f, message_alerte: message } }];"
+      },
+      "id": "node15",
+      "name": "Construire Message d'Alerte",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3120, 420]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "#comptabilite"
+        },
+        "text": "={{ $json.message_alerte }}",
+        "otherOptions": {}
+      },
+      "id": "node16",
+      "name": "Slack - Alerter le Comptable",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [3380, 420]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "VOTRE_ID_GOOGLE_SHEET"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Anomalies"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Fournisseur": "={{ $json.fournisseur }}",
+            "ICE": "={{ $json.ice }}",
+            "Date": "={{ $json.date_facture }}",
+            "Numero": "={{ $json.numero_facture }}",
+            "Montant_TTC": "={{ $json.montant_ttc }}",
+            "Erreurs": "={{ $json.erreurs_finales.join(' | ') }}",
+            "Niveau_Risque_IA": "={{ $json.anomalie_ia.niveau_risque }}",
+            "Lien_Fichier": "={{ $json.webViewLink }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "node17",
+      "name": "Google Sheets - Ajouter Anomalie",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [3640, 420]
+    },
+    {
+      "parameters": {
+        "operation": "move",
+        "fileId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.fileId }}"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "ID_DOSSIER_A_VERIFIER"
+        },
+        "options": {}
+      },
+      "id": "node18",
+      "name": "Google Drive - Déplacer vers À Vérifier",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [3900, 420]
+    }
+  ],
+  "connections": {
+    "Déclencheur Google Drive": {
+      "main": [[{ "node": "Télécharger le Fichier", "type": "main", "index": 0 }]]
+    },
+    "Télécharger le Fichier": {
+      "main": [[{ "node": "Préparer Base64 & Métadonnées", "type": "main", "index": 0 }]]
+    },
+    "Préparer Base64 & Métadonnées": {
+      "main": [[{ "node": "Gemini - Extraction Facture", "type": "main", "index": 0 }]]
+    },
+    "Gemini - Extraction Facture": {
+      "main": [[{ "node": "Parser Extraction Gemini", "type": "main", "index": 0 }]]
+    },
+    "Parser Extraction Gemini": {
+      "main": [[{ "node": "Contrôle Fiscal & Mathématique", "type": "main", "index": 0 }]]
+    },
+    "Contrôle Fiscal & Mathématique": {
+      "main": [[{ "node": "Google Sheets - Historique Fournisseur", "type": "main", "index": 0 }]]
+    },
+    "Google Sheets - Historique Fournisseur": {
+      "main": [[{ "node": "Agréger Historique", "type": "main", "index": 0 }]]
+    },
+    "Agréger Historique": {
+      "main": [[{ "node": "Gemini - Détection Anomalies", "type": "main", "index": 0 }]]
+    },
+    "Gemini - Détection Anomalies": {
+      "main": [[{ "node": "Parser Anomalie Gemini", "type": "main", "index": 0 }]]
+    },
+    "Parser Anomalie Gemini": {
+      "main": [[{ "node": "Décision Finale", "type": "main", "index": 0 }]]
+    },
+    "Décision Finale": {
+      "main": [[{ "node": "IF - Facture Valide ?", "type": "main", "index": 0 }]]
+    },
+    "IF - Facture Valide ?": {
+      "main": [
+        [{ "node": "Google Sheets - Ajouter Facture Validée", "type": "main", "index": 0 }],
+        [{ "node": "Construire Message d'Alerte", "type": "main", "index": 0 }]
+      ]
+    },
+    "Google Sheets - Ajouter Facture Validée": {
+      "main": [[{ "node": "Google Drive - Déplacer vers Validées", "type": "main", "index": 0 }]]
+    },
+    "Construire Message d'Alerte": {
+      "main": [[{ "node": "Slack - Alerter le Comptable", "type": "main", "index": 0 }]]
+    },
+    "Slack - Alerter le Comptable": {
+      "main": [[{ "node": "Google Sheets - Ajouter Anomalie", "type": "main", "index": 0 }]]
+    },
+    "Google Sheets - Ajouter Anomalie": {
+      "main": [[{ "node": "Google Drive - Déplacer vers À Vérifier", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "controle-factures-workflow"
+  }
+}
